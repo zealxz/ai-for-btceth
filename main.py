@@ -140,7 +140,7 @@ def main():
         <b>信心:</b> {score}/100<br>
         <b>分析:</b> {reason}<br>
         <br>
-        <i>*Gemini 1.5 Flash 自动生成</i>
+        <i>*Gemini 2.5 Flash 自动生成</i>
         """
         
         print(msg_title)

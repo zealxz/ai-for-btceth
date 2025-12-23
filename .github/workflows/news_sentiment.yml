@@ -20,8 +20,8 @@ jobs:
         python-version: '3.12'
         
     - name: Install dependencies
-      # 这里只需要安装这几个库
-      run: pip install yfinance google-generativeai requests
+      # 改成这就行了，以后你在 requirements.txt 加什么它就装什么
+      run: pip install -r requirements.txt
         
     - name: Run News Bot
       env:

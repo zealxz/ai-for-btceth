@@ -1,33 +1,42 @@
 import os
 import json
-import yfinance as yf
+import feedparser  # 引入新库
 import requests
 import google.generativeai as genai
+from datetime import datetime
 
 # --- 配置 ---
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
-MODEL_NAME = 'gemini-2.5-flash' # 保持一致
+MODEL_NAME = 'gemini-2.5-flash' 
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
 def get_crypto_news():
-    """从 Yahoo Finance 获取最新 BTC 新闻"""
-    print("正在搜集全网新闻...")
+    """从 CoinTelegraph RSS 获取最新新闻 (比 yfinance 更稳定)"""
+    print("正在连接 CoinTelegraph RSS 源...")
     news_summary = ""
+    
+    # CoinTelegraph 的 RSS 地址
+    rss_url = "https://cointelegraph.com/rss"
+    
     try:
-        btc = yf.Ticker("BTC-USD")
-        news_list = btc.news
-        if news_list:
-            for i, item in enumerate(news_list[:5]): # 取前5条
-                title = item.get('title', 'No Title')
-                # 尝试获取发布时间
-                news_summary += f"{i+1}. {title}\n"
-        else:
-            news_summary = "今日雅虎财经未返回特定新闻。"
+        feed = feedparser.parse(rss_url)
+        
+        if not feed.entries:
+            return "RSS源暂时无法连接或无更新。"
+            
+        print(f"成功获取 {len(feed.entries)} 条新闻")
+        
+        # 取前 8 条新闻，信息量更足
+        for i, entry in enumerate(feed.entries[:8]):
+            title = entry.title
+            # 这里的 published 通常格式比较乱，我们只取标题即可，AI 自己知道时效性
+            news_summary += f"{i+1}. {title}\n"
+            
     except Exception as e:
-        news_summary = f"新闻获取失败: {e}"
+        news_summary = f"RSS抓取失败: {e}"
         
     return news_summary
 
@@ -37,19 +46,20 @@ def analyze_sentiment(news_text):
         model = genai.GenerativeModel(MODEL_NAME)
         
         prompt = f"""
-        你是一个加密货币舆情分析师。请阅读以下今日新闻标题：
+        你是一个加密货币市场情报官。请根据以下来自 CoinTelegraph 的最新新闻标题，分析今日市场情绪：
+        
         {news_text}
         
-        任务：
-        1. 判断今日大盘情绪：Bullish(看涨), Bearish(看跌), Neutral(中性)。
-        2. 情绪打分：-10(极度恐慌) 到 +10(极度贪婪)。
-        3. 用中文写一句话日报总结。
+        【任务】
+        1. **情绪倾向**：Bullish (看涨) / Bearish (看跌) / Neutral (中性)。
+        2. **恐慌贪婪分**：-10 (极度恐慌/利空) 到 +10 (极度贪婪/利好)。
+        3. **一句话日报**：用中文总结市场正在发生的大事（20字以内）。
         
-        请返回 JSON:
+        请严格返回 JSON:
         {{
             "sentiment": "Bullish",
-            "score": 5,
-            "summary": "机构ETF买入强劲，市场情绪回暖"
+            "score": 6,
+            "summary": "SEC批准新ETF申请，市场普遍看涨"
         }}
         """
         
@@ -58,37 +68,50 @@ def analyze_sentiment(news_text):
         return json.loads(response.text)
     except Exception as e:
         print(f"舆情分析出错: {e}")
-        return {"sentiment": "Neutral", "score": 0, "summary": "AI分析暂时不可用"}
+        return {"sentiment": "Neutral", "score": 0, "summary": "AI分析服务暂时繁忙"}
 
 def send_pushplus(html_content):
     if not PUSHPLUS_TOKEN: return
     requests.post('http://www.pushplus.plus/send', 
-                  json={"token": PUSHPLUS_TOKEN, "title": "📢 每日币圈早报", "content": html_content, "template": "html"})
+                  json={"token": PUSHPLUS_TOKEN, "title": "📢 每日币圈风向", "content": html_content, "template": "html"})
 
 def main():
     news_text = get_crypto_news()
-    print(f"获取到的新闻:\n{news_text}")
     
+    # 如果抓取失败，直接发报错
+    if "RSS抓取失败" in news_text:
+        send_pushplus(f"<h3>❌ 系统报错</h3><p>{news_text}</p>")
+        return
+
     result = analyze_sentiment(news_text)
     
     score = result.get('score', 0)
     sentiment = result.get('sentiment', 'Neutral')
+    summary = result.get('summary', '无总结')
     
-    # 颜色逻辑
+    # 颜色逻辑：利好是红(国内习惯)或绿，这里用 Emoji 增强
     color = "#333"
-    if score > 0: color = "#d93025" # 红色看涨
-    elif score < 0: color = "#188038" # 绿色看跌
+    icon = "⚖️"
+    if score >= 3: 
+        color = "#d93025" # 红 (利好)
+        icon = "🔥"
+    elif score <= -3: 
+        color = "#188038" # 绿 (利空)
+        icon = "❄️"
     
     html = f"""
-    <h2 style='color:{color}'>{sentiment} (情绪分: {score})</h2>
-    <p><b>日报总结:</b> {result.get('summary', '')}</p>
+    <div style="padding: 10px; border-left: 4px solid {color}; background-color: #f9f9f9;">
+        <h2 style='color:{color}; margin:0;'>{icon} {sentiment} ({score})</h2>
+        <p style="font-size: 16px; font-weight: bold; margin-top: 10px;">{summary}</p>
+    </div>
     <hr>
-    <h4>News Source:</h4>
-    <pre style='white-space: pre-wrap;'>{news_text}</pre>
+    <h4>🌍 CoinTelegraph 头条:</h4>
+    <pre style='white-space: pre-wrap; font-family: sans-serif; color: #555;'>{news_text}</pre>
     <br>
-    <small>Powered by {MODEL_NAME}</small>
+    <small>Powered by {MODEL_NAME} & RSS</small>
     """
     
+    print(f"分析完成: {sentiment} ({score})")
     send_pushplus(html)
 
 if __name__ == "__main__":

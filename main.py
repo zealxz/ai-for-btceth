@@ -4,14 +4,13 @@ import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import requests
 
 # --- 配置部分 ---
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
-# 这里的模型版本可以根据需要调整，推荐 flash-001 或 pro
-MODEL_NAME = 'gemini-2.5-flash'
+# 🔥 锁定你测试成功的 2.5 版本
+MODEL_NAME = 'gemini-2.5-flash' 
 
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
@@ -20,142 +19,133 @@ else:
     exit(1)
 
 def get_market_data(symbol='BTC-USD'):
-    """获取行情并计算指标 (V2.0: 增加 MACD)"""
+    """获取行情并计算指标"""
     print(f"正在获取 {symbol} 数据...")
     try:
         ticker = yf.Ticker(symbol)
-        # 获取更多数据以计算 MACD
         df = ticker.history(period="7d", interval="1h")
         
-        if df.empty:
-            return None, 0
+        if df.empty: return None, 0
 
-        # 1. 计算 RSI
+        # 计算指标
         df['RSI'] = ta.rsi(df['Close'], length=14)
-        
-        # 2. 计算 EMA (趋势)
         df['EMA_20'] = ta.ema(df['Close'], length=20)
         df['EMA_50'] = ta.ema(df['Close'], length=50)
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14) # ATR用于计算止损距离
         
-        # 3. 计算 MACD (动量 - 新增!)
-        # macd 列名通常是 MACD_12_26_9, MACDh_... (柱), MACDs_... (信号)
-        macd = ta.macd(df['Close'], fast=12, slow=26, signal=9)
+        # MACD
+        macd = ta.macd(df['Close'])
         df = pd.concat([df, macd], axis=1)
         
         latest = df.iloc[-1]
         
-        # 提取 MACD 值（不同库版本列名可能略有不同，这里取最后一列的相对位置或通用名）
-        # pandas_ta 默认列名: MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
-        macd_val = latest['MACD_12_26_9']
-        macd_signal = latest['MACDs_12_26_9']
-        macd_hist = latest['MACDh_12_26_9']
-        
-        current_price = latest['Close']
+        # 自动获取MACD列名
+        macd_col = [c for c in df.columns if c.startswith('MACD_')][0]
+        macds_col = [c for c in df.columns if c.startswith('MACDs_')][0]
         
         summary = f"""
-        交易对: {symbol}
-        现价: ${current_price:.2f}
+        标的: {symbol}
+        现价: {latest['Close']:.2f}
+        ATR(波动率): {latest['ATR']:.2f}
         
-        [技术指标详情]
-        1. RSI(14): {latest['RSI']:.2f} 
-           (参考: >70超买, <30超卖, 40-60为震荡)
-           
-        2. 均线趋势:
-           EMA(20): {latest['EMA_20']:.2f}
-           EMA(50): {latest['EMA_50']:.2f}
-           状态: {'短期看涨(价格>EMA20)' if current_price > latest['EMA_20'] else '短期看跌(价格<EMA20)'}
-           
-        3. MACD(12,26,9):
-           MACD线: {macd_val:.2f}
-           信号线: {macd_signal:.2f}
-           柱状图: {macd_hist:.2f}
-           状态: {'金叉(动能增强)' if macd_hist > 0 else '死叉(动能减弱)'}
+        [技术指标]
+        RSI(14): {latest['RSI']:.2f}
+        EMA20: {latest['EMA_20']:.2f} | EMA50: {latest['EMA_50']:.2f}
+        MACD: {latest[macd_col]:.2f} | 信号线: {latest[macds_col]:.2f}
         """
-        return summary, current_price
+        return summary, latest['Close']
 
     except Exception as e:
-        print(f"❌ 数据获取错误: {e}")
+        print(f"❌ 数据错误: {e}")
         return None, 0
 
-def analyze_with_gemini(data_summary):
-    """调用 AI 分析 (V2.0: 扮演严厉的风控官)"""
-    if not data_summary:
-        return {"confidence": 0, "reason": "数据源故障", "signal": "WAIT"}
+def analyze_with_gemini(data_summary, current_price):
+    """AI 分析师 (支持做空 + 止盈止损计算)"""
+    if not data_summary: return None
 
-    print("正在咨询 AI 风控官...")
-    model = genai.GenerativeModel(MODEL_NAME)
-    
-    # 🔥 V2.0 核心修改：提示词 (Prompt) 变得更严厉
-    prompt = f"""
-    你是一个【极度保守、厌恶风险】的加密货币风控总监。你的任务是审核交易信号。
-    
-    请根据以下数据进行严格审查：
-    {data_summary}
-    
-    【评分规则】
-    1. 基础分只有 50 分。
-    2. 如果 RSI 在 40-60 之间（无方向），扣分，建议观望。
-    3. 如果 MACD 和 均线 信号矛盾（一个看涨一个看跌），必须大幅扣分。
-    4. 只有当 RSI、均线、MACD 三者【完全共振】时，才能给出 >80 的高分。
-    5. 不要试图讨好用户，如果有风险，请直言“风险过大”。
-    
-    请输出 JSON：
-    {{
-        "signal": "BUY" 或 "SELL" 或 "WAIT",
-        "confidence": 0-100的整数,
-        "reason": "毒舌一点的简短点评（20字以内）"
-    }}
-    """
-    
-    safety_settings = {
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-    }
-    generation_config = {"response_mime_type": "application/json"}
-    
+    print(f"🧠 正在调用 {MODEL_NAME} 进行策略计算...")
     try:
-        response = model.generate_content(prompt, safety_settings=safety_settings, generation_config=generation_config)
+        model = genai.GenerativeModel(MODEL_NAME)
+        
+        prompt = f"""
+        你是一个专业的加密货币量化交易员。请分析以下数据：
+        {data_summary}
+        
+        任务：
+        1. 决策方向：做多(LONG)、做空(SHORT) 或 观望(WAIT)。
+        2. 信心分数：0-100。
+        3. **关键任务**：如果开仓，请根据 ATR 和技术支撑/压力位，计算具体的止盈(TP)和止损(SL)价格。
+           - 做多(LONG): TP > 现价, SL < 现价。
+           - 做空(SHORT): TP < 现价, SL > 现价。
+           - 观望(WAIT): TP和SL填 0。
+        
+        请严格返回 JSON 格式：
+        {{
+            "signal": "LONG",
+            "confidence": 85,
+            "entry_price": {current_price},
+            "tp_price": 92500.00,
+            "sl_price": 88000.00,
+            "reason": "RSI突破50，MACD金叉，看涨"
+        }}
+        """
+        
+        # 强制 JSON 输出
+        generation_config = {"response_mime_type": "application/json"}
+        
+        response = model.generate_content(prompt, generation_config=generation_config)
         return json.loads(response.text)
     except Exception as e:
-        print(f"AI 分析出错: {e}")
-        return {"confidence": 0, "reason": "API解析错误", "signal": "WAIT"}
+        print(f"AI 思考出错: {e}")
+        # 出错时返回默认安全值
+        return {"signal": "WAIT", "confidence": 0, "reason": f"API Error: {str(e)[:20]}"}
 
 def send_pushplus(title, content):
     if not PUSHPLUS_TOKEN: return
-    url = 'http://www.pushplus.plus/send'
-    requests.post(url, json={"token": PUSHPLUS_TOKEN, "title": title, "content": content, "template": "html"})
-    print("✅ 推送已发送")
+    requests.post('http://www.pushplus.plus/send', 
+                  json={"token": PUSHPLUS_TOKEN, "title": title, "content": content, "template": "html"})
+    print("✅ 推送发送成功")
 
 def main():
     symbol = 'BTC-USD'
     data_text, price = get_market_data(symbol)
     
     if data_text:
-        result = analyze_with_gemini(data_text)
-        score = result.get('confidence', 50)
-        reason = result.get('reason', '...')
+        result = analyze_with_gemini(data_text, price)
+        
         signal = result.get('signal', 'WAIT')
+        score = result.get('confidence', 0)
+        tp = result.get('tp_price', 0)
+        sl = result.get('sl_price', 0)
+        reason = result.get('reason', '')
         
-        # 图标逻辑
-        icon = "☕" # 默认观望
-        if signal == "BUY": 
-            if score > 80: icon = "🔥 强烈买入"
-            else: icon = "🟢 谨慎买入"
-        elif signal == "SELL":
-            if score > 80: icon = "💀 紧急逃顶"
-            else: icon = "🔴 建议减仓"
+        # 装饰图标
+        icon = "☕"
+        if signal == "LONG": icon = "🟢 做多"
+        elif signal == "SHORT": icon = "🔴 做空"
         
-        msg_title = f"{icon} {signal} (分:{score})"
+        # 计算盈亏比 (RR Ratio)
+        rr_info = ""
+        if signal != "WAIT" and tp != 0 and sl != 0:
+            diff_profit = abs(tp - price)
+            diff_loss = abs(price - sl)
+            if diff_loss > 0:
+                rr = diff_profit / diff_loss
+                rr_info = f" | 盈亏比 1:{rr:.1f}"
+
+        msg_title = f"{icon} {symbol} ({score}分)"
         msg_content = f"""
-        <b>标的:</b> {symbol}<br>
+        <b>决策:</b> {signal} {rr_info}<br>
         <b>现价:</b> ${price:,.2f}<br>
-        <b>AI评语:</b> {reason}<br>
-        <b>信心:</b> {score}/100<br>
         <hr>
-        <small>{data_text.replace(chr(10), '<br>')}</small>
+        <b>🎯 止盈 (TP):</b> ${tp:,.2f}<br>
+        <b>🛡️ 止损 (SL):</b> ${sl:,.2f}<br>
+        <hr>
+        <b>AI 逻辑:</b> {reason}<br>
+        <br>
+        <small>Model: {MODEL_NAME}</small>
         """
+        
         print(msg_title)
         send_pushplus(msg_title, msg_content)
 
